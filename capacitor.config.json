@@ -1,0 +1,6 @@
+{
+  "appId": "com.khendzodsit.ai",
+  "appName": "khendzodsit AI",
+  "webDir": "www",
+  "server": { "androidScheme": "https" }
+}
