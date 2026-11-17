@@ -25,6 +25,7 @@ const candleRequestSymbols = new Map();
 const candleSubscriptionSymbols = new Map();
 const failedMarketSymbols = new Set();
 let signalAlertsEnabled = (()=>{try{return localStorage.getItem('khendzodsit-signal-alerts')==='true';}catch{return false;}})();
+let nativeSignalNotificationPermission = 'prompt';
 const marketSignalStates = new Map();
 let resolvedDerivMarkets = [];
 let nextMarketRequestId = 100;
@@ -192,7 +193,17 @@ function updateMarketSignalAlert(item,data,a,plan){
   if(plan){sendMarketSignalNotification(item,data,plan);return;}
   if(previous&&previous!=='WAIT'&&previous!=='INVALID'&&a.invalid)sendMarketInvalidNotification(item);
 }
+function nativeSignalNotifications(){
+  return window.Capacitor?.isNativePlatform?.() ? window.KhendzodsitNotifications : null;
+}
 function signalNotify(title,body,tag){
+  const nativeNotifications=nativeSignalNotifications();
+  if(nativeNotifications){
+    if(nativeSignalNotificationPermission!=='granted')return;
+    let id=0;for(const ch of tag)id=(id*31+ch.charCodeAt(0))|0;id=Math.abs(id)||1;
+    nativeNotifications.schedule({notifications:[{id,title,body,channelId:'market-signals',schedule:{at:new Date(Date.now()+1000)},extra:{url:'./'}}]}).catch(()=>{$('signalAlertsStatus').textContent='Phone notification failed. Check notification permission in Android settings.';});
+    return;
+  }
   if(!('Notification'in window)||Notification.permission!=='granted')return;
   const options={body,tag,renotify:true,icon:'./icon-192.png',badge:'./icon-192.png',data:{url:'./'}};
   if('serviceWorker'in navigator&&navigator.serviceWorker.controller)navigator.serviceWorker.ready.then(reg=>reg.showNotification(title,options)).catch(()=>new Notification(title,options));
@@ -204,6 +215,18 @@ function sendMarketSignalNotification(item,data,plan){
 }
 function sendMarketInvalidNotification(item){signalNotify(`${item.key} setup invalidated`,'Price closed beyond the CRT invalidation level. Reassess the setup.',`${item.key}-invalid`);}
 async function toggleSignalAlerts(){
+  const nativeNotifications=nativeSignalNotifications();
+  if(nativeNotifications){
+    let permission=nativeSignalNotificationPermission;
+    try{permission=(await nativeNotifications.checkPermissions()).display;if(permission!=='granted')permission=(await nativeNotifications.requestPermissions()).display;}catch{permission='denied';}
+    nativeSignalNotificationPermission=permission;
+    if(permission!=='granted'){$('signalAlertsStatus').textContent='Phone notifications are blocked. Allow notifications for khendzodsit AI in Android settings.';syncSignalAlertControls();return;}
+    if(signalAlertsEnabled){signalAlertsEnabled=false;try{localStorage.setItem('khendzodsit-signal-alerts','false');}catch{}syncSignalAlertControls();return;}
+    try{await nativeNotifications.createChannel({id:'market-signals',name:'Market Signals',description:'New BUY and SELL trading setups',importance:4,vibration:true});}catch{}
+    signalAlertsEnabled=true;try{localStorage.setItem('khendzodsit-signal-alerts','true');}catch{}syncSignalAlertControls();marketSignalStates.clear();renderMarketSignalBoard();
+    signalNotify('Khendzodsit AI alerts enabled','Phone alerts are ready for new live BUY/SELL setups with entry, stop, and targets.','signal-alerts-enabled');
+    return;
+  }
   if(!('Notification'in window)){$('signalAlertsStatus').textContent='Browser notifications are not supported on this device.';return;}
   if(signalAlertsEnabled&&'Notification'in window&&Notification.permission==='granted'){signalAlertsEnabled=false;try{localStorage.setItem('khendzodsit-signal-alerts','false');}catch{}syncSignalAlertControls();return;}
   let permission=Notification.permission;if(permission==='default')permission=await Notification.requestPermission();
@@ -211,9 +234,11 @@ async function toggleSignalAlerts(){
   signalAlertsEnabled=true;try{localStorage.setItem('khendzodsit-signal-alerts','true');}catch{}syncSignalAlertControls();marketSignalStates.clear();renderMarketSignalBoard();
   signalNotify('Khendzodsit AI alerts enabled','New live BUY/SELL setups will include entry, stop, and target levels.','signal-alerts-enabled');
 }
-function syncSignalAlertControls(){
-  const button=$('signalAlertsToggle');if(!button)return;const supported='Notification'in window,granted=supported&&Notification.permission==='granted',active=signalAlertsEnabled&&granted;button.textContent=active?'Disable alerts':'Enable alerts';button.setAttribute('aria-pressed',String(active));
-  $('signalAlertsStatus').textContent=!supported?'Browser notifications are not supported on this device.':active?'Alerts enabled · new live setups include entry, stop, and targets.':Notification.permission==='denied'?'Notifications are blocked in browser settings. Enable them there to receive alerts.':granted?'Alerts are off. Enable them to receive new BUY/SELL setups.':'Allow browser notifications to receive new BUY/SELL setups.';
+async function syncSignalAlertControls(){
+  const button=$('signalAlertsToggle');if(!button)return;const nativeNotifications=nativeSignalNotifications(),supported=Boolean(nativeNotifications)||('Notification'in window);
+  if(nativeNotifications){try{nativeSignalNotificationPermission=(await nativeNotifications.checkPermissions()).display;}catch{nativeSignalNotificationPermission='denied';}}
+  const granted=nativeNotifications?nativeSignalNotificationPermission==='granted':supported&&Notification.permission==='granted',active=signalAlertsEnabled&&granted;button.textContent=active?'Disable alerts':'Enable alerts';button.setAttribute('aria-pressed',String(active));
+  $('signalAlertsStatus').textContent=!supported?'Phone notifications are not supported in this app.':nativeNotifications?(active?'Phone alerts enabled · new live setups include entry, stop, and targets.':nativeSignalNotificationPermission==='denied'?'Phone notifications are blocked. Allow them for khendzodsit AI in Android settings.':'Enable alerts to allow phone notifications for new BUY/SELL setups.'):active?'Alerts enabled · new live setups include entry, stop, and targets.':Notification.permission==='denied'?'Notifications are blocked in browser settings. Enable them there to receive alerts.':granted?'Alerts are off. Enable them to receive new BUY/SELL setups.':'Allow browser notifications to receive new BUY/SELL setups.';
 }
 
 function buildChartOverlays(data,a){
