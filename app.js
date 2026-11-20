@@ -96,6 +96,67 @@ function analyze(data){
   let message=sweep<0?'No confirmed sweep yet. Wait for price to move beyond the range and close back inside.':invalid?'A close breached the far side of the CRT range; treat the setup as invalidated.':breakAt<0?'Sweep confirmed. Wait for a strong opposite candle level to break before considering a setup.':retestAt<0?'Model #1 level has broken. The retest has not appeared in the loaded candles yet.':'The Model #1 level broke and price returned to test it in the loaded data.';
   return {direction:invalid?0:dir,rawDirection:dir,status,message,range,sweep,level,levelAt,breakAt,retestAt,checks,all,state,details,invalid};
 }
+function emaSeries(values,period){
+  if(values.length<period)return null;const alpha=2/(period+1),out=[values.slice(0,period).reduce((a,b)=>a+b,0)/period];
+  for(let i=period;i<values.length;i++)out.push(values[i]*alpha+out.at(-1)*(1-alpha));return out.at(-1);
+}
+function evaluateStrategyEngine(data){
+  if(data.length<30)return null;
+  const recent=data.slice(-60),closes=recent.map(c=>c.close),last=recent.at(-1),prior=recent.slice(0,-1),atrRows=recent.slice(-14),atr=atrRows.reduce((sum,c)=>sum+c.high-c.low,0)/atrRows.length;
+  const e9=emaSeries(closes,9),e21=emaSeries(closes,21),e50=emaSeries(closes,50),gains=[],losses=[];
+  for(let i=Math.max(1,closes.length-14);i<closes.length;i++){const d=closes[i]-closes[i-1];gains.push(Math.max(0,d));losses.push(Math.max(0,-d));}
+  const avgGain=gains.reduce((a,b)=>a+b,0)/Math.max(1,gains.length),avgLoss=losses.reduce((a,b)=>a+b,0)/Math.max(1,losses.length),rsi=avgLoss===0?100:100-100/(1+avgGain/avgLoss);
+  const swing=prior.slice(-20),swingHigh=Math.max(...swing.map(c=>c.high)),swingLow=Math.min(...swing.map(c=>c.low)),crt=analyze(data),strategies=[];
+  for(const dir of [1,-1]){
+    const trend=(e9>e21&&e21>e50&&last.close>e21)?1:(e9<e21&&e21<e50&&last.close<e21)?-1:0;
+    const aligned=trend===dir?1:trend===-dir?-1:0,momentum=(dir>0?(rsi>=52&&rsi<=74):(rsi<=48&&rsi>=26))?1:(dir>0?rsi<45:rsi>55)?-1:0;
+    const pullback=Math.abs(last.close-e21)<=Math.max(atr*.65,Math.abs(last.close)*.0001)&&aligned===1?1:aligned===-1?-1:0;
+    const trendScore=Math.max(0,Math.min(100,50+aligned*24+momentum*16+pullback*10));
+    const crtAligned=crt.direction===dir&&!crt.invalid?1:crt.rawDirection===-dir||crt.invalid?-1:0,crtProgress=crt.checks?.filter(x=>x[1]).length||0;
+    const crtScore=Math.max(0,Math.min(100,38+crtAligned*34+Math.min(5,crtProgress)*5));
+    const breakout=dir>0?last.close>swingHigh:last.close<swingLow,nearEdge=dir>0?last.close>=swingHigh-atr*.3:last.close<=swingLow+atr*.3;
+    const breakoutScore=Math.max(0,Math.min(100,42+(breakout?34:nearEdge?13:0)+momentum*12+aligned*12));
+    strategies.push({key:'trend',name:'Trend pullback',direction:dir,score:trendScore,reason:`EMA structure ${aligned===1?'aligned':aligned===-1?'opposed':'mixed'} · RSI ${rsi.toFixed(0)}`},{key:'crt',name:'CRT sweep · Model #1',direction:dir,score:crtScore,reason:crt.direction===dir?crt.state:'Waiting for a matching CRT sweep and retest'},{key:'breakout',name:'Range breakout',direction:dir,score:breakoutScore,reason:breakout?'Price closed beyond the recent range':nearEdge?'Price is testing a range edge':'Price remains inside the recent range'});
+  }
+  strategies.sort((a,b)=>b.score-a.score);const best=strategies[0],opposing=strategies.find(s=>s.direction===-best.direction),edge=best.score-(opposing?.score||0),direction=best.score>=64&&edge>=9?best.direction:0;
+  const confidence=direction?Math.round(Math.min(90,Math.max(35,45+edge*.75+(best.score-60)*.35))):Math.round(Math.max(15,Math.min(49,40+edge*.25)));
+  const risk=Math.max(atr*1.25,Math.abs(last.close)*.0002),entry=last.close,stop=direction>0?Math.min(swingLow,last.close-risk):direction<0?Math.max(swingHigh,last.close+risk):NaN,unit=direction?Math.abs(entry-stop):risk;
+  return {strategies,best,direction,score:best.score,confidence,entry,stop,target1:direction?entry+direction*unit:NaN,target2:direction?entry+direction*unit*2:NaN,rsi,atr};
+}
+function renderStrategyEngine(){
+  const result=candles.length?evaluateStrategyEngine(candles):null,selected=$('symbol').selectedOptions[0]?.dataset.watch||'market';
+  if(!result){$('engineStatus').textContent='Waiting for at least 30 live or imported candles';$('engineDirectionBadge').textContent='WAIT';$('engineDirectionBadge').className='engine-direction wait';$('engineScore').textContent='—';$('engineConfidence').textContent='—';$('engineMeter').style.width='0%';$('engineStrategy').textContent='—';$('engineStrategyReason').textContent='Connect live candles to rank setups.';['engineEntry','engineStop','engineTarget1','engineTarget2'].forEach(id=>$(id).textContent='—');$('engineStrategyList').innerHTML='<span>Trend pullback <b>—</b></span><span>CRT sweep <b>—</b></span><span>Range breakout <b>—</b></span>';return;}
+  const side=result.direction>0?'BUY':result.direction<0?'SELL':'WAIT',digits=Math.min(6,Math.max(2,(String(candles.at(-1).close).split('.')[1]||'').length)),price=x=>formatMarketPrice(x,digits);
+  $('engineStatus').textContent=`${selected} · ${liveMode?'Deriv live':'loaded candles'} · ${candles.length} bars · updates automatically`;$('engineDirectionBadge').textContent=side;$('engineDirectionBadge').className=`engine-direction ${result.direction>0?'buy':result.direction<0?'sell':'wait'}`;$('engineScore').textContent=Math.round(result.score);$('engineConfidence').textContent=`${result.confidence}%`;$('engineMeter').style.width=`${result.confidence}%`;$('engineStrategy').textContent=result.best.name;$('engineStrategyReason').textContent=result.direction?result.best.reason:'No strategy meets the minimum score and agreement threshold. Wait for a clearer setup.';
+  $('engineEntry').textContent=price(result.entry);$('engineStop').textContent=price(result.stop);$('engineTarget1').textContent=price(result.target1);$('engineTarget2').textContent=price(result.target2);
+  $('engineStrategyList').innerHTML=['trend','crt','breakout'].map(key=>{const x=result.strategies.find(s=>s.key===key&&s.direction===result.best.direction);return `<span>${escapeHtml(x.name)} <b>${Math.round(x.score)}</b></span>`;}).join('');
+}
+let dashAutoMonitor=false;
+function dashDigits(){return Math.min(6,Math.max(2,(String(candles.at(-1)?.close??'').split('.')[1]||'').length));}
+function dashPrice(value){return Number.isFinite(value)?formatMarketPrice(value,dashDigits()):'—';}
+function drawDashboardChart(){
+  const canvas=$('dashChart');if(!canvas||$('screen-scan').hidden)return;const box=canvas.getBoundingClientRect(),ratio=window.devicePixelRatio||1,w=Math.max(280,box.width),h=Math.max(190,box.height||270);canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);ctx.fillStyle='#08121c';ctx.fillRect(0,0,w,h);
+  const data=candles.slice(-54),pad={l:8,r:61,t:12,b:23},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;
+  if(data.length<2){ctx.fillStyle='#8ea0a4';ctx.font='10px monospace';ctx.textAlign='center';ctx.fillText('Connect live Deriv candles to display the chart',w/2,h/2);return;}
+  const hi=Math.max(...data.map(c=>c.high)),lo=Math.min(...data.map(c=>c.low)),range=hi-lo||Math.max(1,Math.abs(hi)*.001),max=hi+range*.08,min=lo-range*.08,span=max-min,y=p=>pad.t+(max-p)/span*ph,step=pw/data.length,x=i=>pad.l+step*(i+.5),digits=dashDigits();
+  ctx.font='9px monospace';for(let i=0;i<=5;i++){const yy=pad.t+ph*i/5,price=max-span*i/5;ctx.strokeStyle='#ffffff13';ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();ctx.fillStyle='#9aabad';ctx.textAlign='left';ctx.fillText(formatMarketPrice(price,digits),w-pad.r+5,yy+3);}
+  const line=(value,color,label)=>{const yy=y(value);ctx.setLineDash([5,4]);ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=color;ctx.textAlign='left';ctx.fillText(label,pad.l+4,Math.max(10,yy-4));};
+  const highs=data.slice(0,-1),sHigh=Math.max(...highs.slice(-20).map(c=>c.high)),sLow=Math.min(...highs.slice(-20).map(c=>c.low));line(sHigh,'#ff5567','LIQUIDITY');line(sLow,'#48da91','DEMAND / OB');
+  const closes=data.map(c=>c.close),alpha=2/22;let ema=closes.slice(0,Math.min(21,closes.length)).reduce((a,b)=>a+b,0)/Math.min(21,closes.length);for(let i=Math.min(21,closes.length);i<closes.length;i++)ema=closes[i]*alpha+ema*(1-alpha);let e=closes.slice(0,Math.min(21,closes.length)).reduce((a,b)=>a+b,0)/Math.min(21,closes.length);ctx.strokeStyle='#20d9ee';ctx.lineWidth=1.5;ctx.beginPath();data.forEach((c,i)=>{if(i>=21)e=closes[i]*alpha+e*(1-alpha);const xx=x(i),yy=y(e);if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy);});ctx.stroke();
+  const candleW=Math.max(2,Math.min(8,step*.58));data.forEach((c,i)=>{const xx=x(i),color=c.close>=c.open?'#19ce79':'#ff4357',top=y(Math.max(c.open,c.close)),bottom=y(Math.min(c.open,c.close));ctx.strokeStyle=color;ctx.fillStyle=color;ctx.beginPath();ctx.moveTo(xx,y(c.high));ctx.lineTo(xx,y(c.low));ctx.stroke();ctx.fillRect(xx-candleW/2,top,candleW,Math.max(1,bottom-top));});const last=data.at(-1),yy=y(last.close);ctx.setLineDash([3,3]);ctx.strokeStyle='#a9d850';ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#91bf38';ctx.fillRect(w-pad.r,yy-8,pad.r,16);ctx.fillStyle='#09130e';ctx.textAlign='left';ctx.fillText(formatMarketPrice(last.close,digits),w-pad.r+3,yy+3);
+  ctx.fillStyle='#92a2a5';ctx.textAlign='left';ctx.fillText((data[0].time||'').slice(11,16),pad.l,h-6);ctx.textAlign='right';ctx.fillText((last.time||'').slice(11,16),w-pad.r,h-6);$('dashBarCount').textContent=`${data.length} / ${candles.length} bars`;
+}
+function renderDashboard(){
+  const market=$('symbol').selectedOptions[0]?.dataset.watch||'XAUUSD',frame=$('liveTimeframe').value,last=candles.at(-1),prev=candles.at(-2),result=candles.length?evaluateStrategyEngine(candles):null;
+  $('dashMarket').value=market;document.querySelectorAll('.dash-timeframes button').forEach(x=>x.classList.toggle('active',x.dataset.timeframe===frame));$('dashSymbolLabel').textContent=`${market}${market==='XAUUSD'?' · GOLD':''}`;$('dashChartMarket').textContent=`${market} · ${frame}`;$('dashLiveState').textContent=liveSocket?.readyState===WebSocket.OPEN&&liveMode?'● LIVE':candles.length?'● CANDLES LOADED':'● OFFLINE';$('dashLiveState').classList.toggle('offline',!(liveSocket?.readyState===WebSocket.OPEN&&liveMode));
+  $('dashPrice').textContent=last?dashPrice(last.close):'—';$('dashQuote').textContent=last?dashPrice(last.close):'—';const change=last&&prev?last.close-prev.close:NaN;$('dashPriceChange').textContent=Number.isFinite(change)?`${change>=0?'+':''}${dashPrice(change)} · last bar`:'Waiting for live candles';$('dashPriceChange').className=Number.isFinite(change)?change>=0?'up':'down':'';
+  const side=result?.direction>0?'BUY':result?.direction<0?'SELL':'WAIT';$('dashPrediction').textContent=side;$('dashSignalCard').className=`dash-panel dash-ai-card ${side.toLowerCase()}`;$('dashConfidence').textContent=result?`${result.confidence}%`:'—';$('dashScore').textContent=result?Math.round(result.score):'—';$('dashScoreMeter').style.width=result?`${Math.round(result.score)}%`:'0%';$('dashEntry').textContent=result?.direction?dashPrice(result.entry):'—';$('dashStop').textContent=result?.direction?dashPrice(result.stop):'—';$('dashTarget').textContent=result?.direction?dashPrice(result.target1):'—';$('dashStrategy').textContent=result?.best.name||'Need 30 candles';
+  const recent=candles.slice(-25),prior=recent.slice(0,-1),sHigh=prior.length?Math.max(...prior.map(c=>c.high)):NaN,sLow=prior.length?Math.min(...prior.map(c=>c.low)):NaN;let trend='WAITING';if(recent.length>=22){const closes=recent.map(c=>c.close),fast=emaSeries(closes,9),slow=emaSeries(closes,21);trend=fast>slow?'BULLISH':fast<slow?'BEARISH':'RANGING';}$('dashStructure').textContent=trend;$('dashStructure').className=trend==='BEARISH'?'bear':trend==='RANGING'||trend==='WAITING'?'neutral':'';
+  const bos=last&&Number.isFinite(sHigh)&&last.close>sHigh?'BOS ↑':last&&Number.isFinite(sLow)&&last.close<sLow?'BOS ↓':'No confirmed break';$('dashBos').textContent=bos;$('dashBos').className=bos.includes('↑')?'':bos.includes('↓')?'bear':'neutral';const top=recent.length?Math.max(...recent.map(c=>c.high)):NaN,bottom=recent.length?Math.min(...recent.map(c=>c.low)):NaN,mid=(top+bottom)/2;const zone=last&&Number.isFinite(mid)?last.close>mid?'PREMIUM':last.close<mid?'DISCOUNT':'EQUILIBRIUM':'—';$('dashZone').textContent=zone;$('dashZone').className=zone==='PREMIUM'?'bear':zone==='DISCOUNT'?'':'neutral';
+  const econ=Array.isArray(window.khEconomicEvents)?window.khEconomicEvents:[],upcoming=econ.filter(e=>Date.parse(e.time)>=Date.now()).sort((a,b)=>Date.parse(a.time)-Date.parse(b.time)).slice(0,3);let rows=upcoming.map(e=>`<div class="dash-news-row"><time>${escapeHtml(new Intl.DateTimeFormat('en-ZA',{timeZone:'Africa/Johannesburg',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(e.time)))}</time><b>${escapeHtml(e.currency||'')} · ${escapeHtml(e.title||'Economic release')}</b><small>${escapeHtml(String(e.impact||'').toUpperCase())}</small></div>`);if(!rows.length)rows=macroNewsItems.slice(0,3).map(n=>`<div class="dash-news-row"><time>NEWS</time><b>${escapeHtml(n.title)}</b><small>${escapeHtml(n.source||'LIVE')}</small></div>`);$('dashNewsList').innerHTML=rows.length?rows.join(''):'<p>No upcoming events loaded. Feeds refresh in News Feed.</p>';
+  const balance=Number($('dashBalance').value),peak=Number($('dashPeak').value),pnl=Number($('dashDayPnl').value),limit=Number($('dashDailyLimit').value),ddLimit=Number($('dashDrawdownLimit').value),riskPct=limit>0?Math.abs(Math.min(0,pnl))/Math.max(1,balance)*100:NaN,dd=peak>0&&$('dashBalance').value!==''?Math.max(0,(peak-balance)/peak*100):NaN,hasRisk=Number.isFinite(riskPct)&&$('dashDayPnl').value!==''&&$('dashBalance').value!==''&&Number.isFinite(dd);$('dashDailyLoss').textContent=Number.isFinite(riskPct)&&$('dashDayPnl').value!==''&&$('dashBalance').value!==''?`${riskPct.toFixed(2)}% / ${limit}%`:'Enter balance + daily P/L';$('dashDrawdown').textContent=Number.isFinite(dd)?`${dd.toFixed(2)}% / ${ddLimit}%`:'Enter balance + peak';$('dashHealth').textContent=hasRisk?riskPct>=limit||dd>=ddLimit?'LIMIT HIT':'WITHIN INPUT LIMITS':'Not connected';$('dashHealth').className=hasRisk?(riskPct>=limit||dd>=ddLimit?'bad':'good'):'';$('dashDailyLoss').className=Number.isFinite(riskPct)&&riskPct>=limit?'bad':'';$('dashDrawdown').className=Number.isFinite(dd)&&dd>=ddLimit?'bad':'';$('dashRiskState').textContent=hasRisk?riskPct>=limit||dd>=ddLimit?'CHECK LIMITS':'MANUAL INPUTS':'DEMO INPUTS';$('dashRiskState').className=hasRisk&&(riskPct>=limit||dd>=ddLimit)?'bad':'good';
+  if(!$('screen-scan').hidden)drawDashboardChart();
+}
 function render(){
   if(candles.length>chartLastBarCount&&chartOffset>0)chartOffset+=candles.length-chartLastBarCount;
   chartLastBarCount=candles.length;
@@ -105,7 +166,7 @@ function render(){
   $('chartSymbol').textContent=$('symbol').selectedOptions[0]?.dataset.watch||$('symbol').value||'MARKET';
   $('chartCount').textContent=`${candles.length} candles`;
   renderMacroSnapshot();
-  if(!candles.length){currentAnalysis=null;renderSignals();drawChart();return;}
+  if(!candles.length){currentAnalysis=null;renderSignals();renderStrategyEngine();renderDashboard();drawChart();return;}
   const a=analyze(candles),r=a.range;currentAnalysis=a;
   $('rangeHigh').textContent=fmt(r?.hi);$('rangeLow').textContent=fmt(r?.lo);$('equilibrium').textContent=fmt(r?.eq);
   $('signalDirection').textContent=a.direction===0?(a.invalid?'SETUP INVALID':'WAIT'):a.direction>0?'BUY':'SELL';
@@ -114,7 +175,7 @@ function render(){
   $('signalIcon').textContent=a.direction>0?'↗':a.direction<0?'↘':'⌁';$('signalIcon').className=`signal-icon ${a.direction>0?'bull':a.direction<0?'bear':''}`;
   $('checkCount').textContent=`${a.all||0} / ${a.checks.length}`;$('meterFill').style.width=`${(a.all||0)/a.checks.length*100}%`;
   $('detailList').innerHTML=a.details.map((d,i)=>`<li><i class="detail-dot ${a.checks[i]?.[1]?'done':''}"></i><span>${d[0]}</span><b>${d[1]}</b></li>`).join('');
-  renderSignals();
+  renderSignals();renderStrategyEngine();renderDashboard();
   const recent=candles.slice(-8).reverse();
   $('candleRows').innerHTML=recent.map(c=>`<tr><td>${escapeHtml(c.time||'—')}</td><td>${fmt(c.open)}</td><td>${fmt(c.high)}</td><td>${fmt(c.low)}</td><td>${fmt(c.close)}</td><td class="${c.close>=c.open?'up':'down'}">${c.close>=c.open?'BULL':'BEAR'}</td></tr>`).join('');
   drawChart();
@@ -382,7 +443,7 @@ async function refreshMacroNews(){
     const good=results.filter(x=>x.status==='fulfilled').length;$('macroUpdated').textContent=good?`Updated ${new Date().toLocaleTimeString()}`:'RSS unavailable';
     $('macroFeedStatus').textContent=good?`Public RSS · ${good}/${MACRO_FEEDS.length} sources responded. Headline bias is a keyword heuristic.`:'Public RSS is unreachable on this network. Use the CSV import below.';
     if(good<MACRO_FEEDS.length)$('newsNote').textContent=`${good} of ${MACRO_FEEDS.length} RSS sources responded; failed sources may be unavailable through public web proxies.`;
-    renderMacroNews();
+    renderMacroNews();renderDashboard();
   }finally{macroNewsBusy=false;$('refreshMacro').disabled=false;}
 }
 function renderMacroSnapshot(){
@@ -489,8 +550,20 @@ function showLiveTick(tick){
 
 document.querySelectorAll('.nav-item').forEach(button=>button.addEventListener('click',()=>{
   const screen=button.dataset.screen;document.querySelectorAll('[data-screen-panel]').forEach(panel=>panel.hidden=panel.dataset.screenPanel!==screen);document.querySelectorAll('.nav-item').forEach(item=>{const active=item===button;item.classList.toggle('active',active);if(active)item.setAttribute('aria-current','page');else item.removeAttribute('aria-current');});
-  if(screen==='chart')requestAnimationFrame(drawChart);if(screen==='news')renderNews();window.scrollTo({top:0,behavior:'smooth'});
+  if(screen==='chart')requestAnimationFrame(drawChart);if(screen==='scan'){document.querySelectorAll('.dash-tabs button').forEach(x=>x.classList.toggle('active',x.dataset.goScreen==='scan'));renderDashboard();requestAnimationFrame(drawDashboardChart);}if(screen==='news')renderNews();window.scrollTo({top:0,behavior:'smooth'});
 }));
+document.querySelectorAll('[data-go-screen]').forEach(button=>button.addEventListener('click',()=>{const target=button.dataset.goScreen;if(target==='scan'||target==='chart'||target==='signals'||target==='news'||target==='settings')document.querySelector(`.nav-item[data-screen="${target}"]`)?.click();}));document.querySelector('[data-dash-action="backtest"]').addEventListener('click',e=>{document.querySelectorAll('.dash-tabs button').forEach(x=>x.classList.toggle('active',x===e.currentTarget));$('dashActionStatus').textContent='Backtesting is not available yet; no historical performance claim is shown.';});
+$('dashMarket').addEventListener('change',()=>{const option=[...$('symbol').options].find(x=>x.dataset.watch===$('dashMarket').value&&!x.disabled);if(!option){$('dashActionStatus').textContent='That market is not available on the current Deriv feed.';return;}$('symbol').value=option.value;$('symbol').dispatchEvent(new Event('change',{bubbles:true}));});
+document.querySelectorAll('.dash-timeframes button').forEach(button=>button.addEventListener('click',()=>{if(button.dataset.timeframe!==$('liveTimeframe').value){$('liveTimeframe').value=button.dataset.timeframe;$('liveTimeframe').dispatchEvent(new Event('change',{bubbles:true}));}document.querySelectorAll('.dash-timeframes button').forEach(x=>x.classList.toggle('active',x===button));}));
+document.querySelectorAll('.dash-tabs button[data-go-screen]').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.dash-tabs button').forEach(x=>x.classList.toggle('active',x===button));}));
+$('dashAlertButton').addEventListener('click',async()=>{await toggleSignalAlerts();$('dashAlertButton').textContent=$('signalAlertsToggle').textContent;});
+const dashRiskIds=['dashBalance','dashPeak','dashDayPnl','dashDailyLimit','dashDrawdownLimit','dashRiskPercent','dashPointValue'];try{const saved=JSON.parse(localStorage.getItem('khendzodsit-dashboard-risk')||'{}');dashRiskIds.forEach(id=>{if(saved[id]!==undefined&&$(id))$(id).value=saved[id];});dashAutoMonitor=localStorage.getItem('khendzodsit-dashboard-auto')==='true';}catch{}
+dashRiskIds.forEach(id=>$(id).addEventListener('change',()=>{const saved={};dashRiskIds.forEach(key=>saved[key]=$(key).value);try{localStorage.setItem('khendzodsit-dashboard-risk',JSON.stringify(saved));}catch{}renderDashboard();}));
+$('dashBuy').addEventListener('click',()=>{$('dashActionStatus').textContent=`Paper BUY preview · ${$('dashSymbolLabel').textContent} · no broker order was sent.`;});$('dashSell').addEventListener('click',()=>{$('dashActionStatus').textContent=`Paper SELL preview · ${$('dashSymbolLabel').textContent} · no broker order was sent.`;});
+$('dashAuto').addEventListener('click',()=>{dashAutoMonitor=!dashAutoMonitor;$('dashAuto').setAttribute('aria-pressed',String(dashAutoMonitor));$('dashAuto').textContent=`◉ Auto monitor ${dashAutoMonitor?'ON':'OFF'}`;try{localStorage.setItem('khendzodsit-dashboard-auto',String(dashAutoMonitor));}catch{}$('dashActionStatus').textContent=dashAutoMonitor?'Signal monitoring is on. It displays analysis only and never submits orders.':'Signal monitoring is off.';});$('dashAuto').setAttribute('aria-pressed',String(dashAutoMonitor));$('dashAuto').textContent=`◉ Auto monitor ${dashAutoMonitor?'ON':'OFF'}`;
+$('dashCalcLot').addEventListener('click',()=>{const balance=Number($('dashBalance').value),risk=Number($('dashRiskPercent').value),point=Number($('dashPointValue').value),analysis=candles.length?evaluateStrategyEngine(candles):null,distance=analysis&&analysis.direction?Math.abs(analysis.entry-analysis.stop):NaN;if(balance>0&&risk>0&&point>0&&distance>0){const lots=balance*(risk/100)/(distance*point);$('dashLotSize').textContent=Number.isFinite(lots)?`${lots.toFixed(2)} lots`:'—';$('dashActionStatus').textContent='Position-size estimate uses your entered balance, risk %, stop distance, and broker value per point per lot. Verify contract specs.';}else{$('dashLotSize').textContent='Set risk values';$('dashActionStatus').textContent='Enter balance, value per price point per lot, and wait for a BUY/SELL setup to calculate size.';}});
+$('liveTimeframe').addEventListener('change',()=>{document.querySelectorAll('.dash-timeframes button').forEach(x=>x.classList.toggle('active',x.dataset.timeframe===$('liveTimeframe').value));});
+window.addEventListener('economic-calendar-updated',()=>renderDashboard());window.addEventListener('resize',()=>{if(!$('screen-scan').hidden)drawDashboardChart();});renderDashboard();
 $('newsInput').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;try{newsItems=parseNews(await f.text());renderNews();$('newsNote').textContent=`Loaded ${newsItems.length} headlines from ${f.name}.`;}catch(err){$('newsNote').textContent=err.message;}e.target.value='';});
 $('refreshMacro').addEventListener('click',refreshMacroNews);
 ['rangeThreshold','modelThreshold','lookbackSetting'].forEach(id=>$(id).addEventListener('change',saveSettings));
@@ -499,7 +572,7 @@ $('connectLive').addEventListener('click',connectLive);
 $('disconnectLive').addEventListener('click',()=>disconnectLive());
 $('connectFromChart').addEventListener('click',()=>document.querySelector('.nav-item[data-screen="settings"]').click());
 $('liveTimeframe').addEventListener('change',()=>{chartOffset=0;chartBarsVisible=60;marketCandleData.clear();marketHistoryLoaded.clear();if(liveSocket){candles=[];disconnectLive(false);connectLive(true);$('liveMessage').textContent='Reloading Deriv candles for all requested markets.';}else{candles=[];render();}});
-$('symbol').addEventListener('change',()=>{chartOffset=0;chartBarsVisible=60;if(liveSocket){candles=[];disconnectLive(false);connectLive(true);$('liveMessage').textContent='Loading Deriv candles for the selected market.';}else drawChart();});
+$('symbol').addEventListener('change',()=>{chartOffset=0;chartBarsVisible=60;candles=[];render();if(liveSocket){disconnectLive(false);connectLive(true);$('liveMessage').textContent='Loading Deriv candles for the selected market.';}});
 window.addEventListener('resize',()=>{if(!$('screen-chart').hidden)drawChart();});
 initChartGestures();initSettings();$('signalAlertsToggle').addEventListener('click',toggleSignalAlerts);syncSignalAlertControls();renderNews();refreshMacroNews();setInterval(()=>{if(!document.hidden)refreshMacroNews();},5*60*1000);connectLive(true);
 window.addEventListener('beforeunload',()=>disconnectLive(false));
