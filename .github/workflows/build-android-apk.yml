@@ -11,8 +11,6 @@ on:
       - "index.html"
       - "app.js"
       - "styles.css"
-      - "chart-scan.js"
-      - "chart-scan-worker.js"
       - "economic-calendar.js"
       - "labor-dashboard.js"
       - "panel-collapse.js"
@@ -53,7 +51,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p www
-          cp index.html app.js styles.css chart-scan.js chart-scan-worker.js economic-calendar.js labor-dashboard.js panel-collapse.js voice-assistant.js manifest.webmanifest icon.svg icon-192.png icon-512.png logo-wide.png sw.js www/
+          cp index.html app.js styles.css economic-calendar.js labor-dashboard.js panel-collapse.js voice-assistant.js manifest.webmanifest icon.svg icon-192.png icon-512.png logo-wide.png sw.js www/
           npx esbuild notifications-bridge.js --bundle --format=iife --outfile=www/capacitor-notifications.bundle.js
 
       - name: Create Android project and build APK
